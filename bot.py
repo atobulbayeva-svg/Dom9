@@ -28,6 +28,7 @@ from telegram.ext import (
 )
 
 import booking_rules as rules
+import guard
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -56,11 +57,18 @@ MODELS = [m.strip() for m in os.getenv("MODELS", "").split(",") if m.strip()] or
 MENU_TEXT = (BASE_DIR / "menu.md").read_text(encoding="utf-8")
 SYSTEM_PROMPT = (BASE_DIR / "system_prompt.md").read_text(encoding="utf-8").replace("{{MENU}}", MENU_TEXT)
 EXTRACT_PROMPT = (BASE_DIR / "booking_prompt.md").read_text(encoding="utf-8")
+FACTS = guard.build_facts(MENU_TEXT)  # допустимые цены, названия и время для проверки ответов
 BOOKINGS_FILE = BASE_DIR / "bookings.csv"
 BOOKING_FIELDS = ["created_at", "user_id", "username", "date", "time", "guests", "name", "phone"]
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
 HISTORY_LIMIT = 8  # сколько последних сообщений отправлять модели
+GUARD_RETRIES = 2  # сколько раз просить модель переписать ответ, нарушивший правила (guard.py)
+CHAT_MAX_TOKENS = 1500  # в чате модель сначала пишет размышление, потом ответ: нужен запас, чтобы ответ не обрезало
+
+THINKING_RE = re.compile(r"<размышление>(.*?)(?:</размышление>|(?=<ответ>)|$)", re.DOTALL | re.IGNORECASE)
+ANSWER_RE = re.compile(r"<ответ>(.*?)(?:</ответ>|$)", re.DOTALL | re.IGNORECASE)
+TAG_RE = re.compile(r"</?(?:ответ|размышление)>", re.IGNORECASE)
 
 MAIN_KB = ReplyKeyboardMarkup([["Меню", "Афиша выходного дня"], ["Забронировать столик"]], resize_keyboard=True)
 CANCEL_KB = ReplyKeyboardMarkup([["Отмена"]], resize_keyboard=True)
@@ -189,12 +197,67 @@ async def ask_llm(
     return None, None
 
 
+def split_reasoning(text: str) -> tuple[str, str]:
+    """Делит ответ модели на (размышление, ответ гостю).
+
+    Гостю идёт только текст из <ответ>. Если тегов нет, это весь текст без <размышление>.
+    Если ответ оборван без закрывающего тега, берём то, что успело прийти.
+    """
+    thinking = " ".join(m.strip() for m in THINKING_RE.findall(text))
+    match = ANSWER_RE.search(text)
+    answer = match.group(1) if match else THINKING_RE.sub("", text)
+    return thinking, TAG_RE.sub("", answer).strip()
+
+
+async def generate_checked(
+    client: httpx.AsyncClient, history: list[dict], user_text: str
+) -> tuple[str | None, str | None]:
+    """Ответ модели, проверенный стражем (guard.py). None, None, если ответить не удалось.
+
+    Нарушение правил -> модели возвращают её ответ со списком нарушений (до GUARD_RETRIES раз).
+    Не помогло -> стиль чинит код, а при неверном факте отправляется безопасный ответ.
+    """
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history[-HISTORY_LIMIT:]]
+    answer, model, violations = "", None, []
+    for attempt in range(1 + GUARD_RETRIES):
+        raw, used = await ask_llm(client, messages, max_tokens=CHAT_MAX_TOKENS)
+        if not raw:
+            break  # все модели недоступны: работаем с тем, что уже есть
+        model = used
+        thinking, answer = split_reasoning(raw)
+        if thinking:
+            log.info("размышление (%s): %s", model, thinking)  # только в консоль, гостю не показываем
+        violations = guard.check(answer, user_text, FACTS)
+        if not violations:
+            return answer, model
+        log.warning("страж, попытка %s из %s: %s", attempt + 1, 1 + GUARD_RETRIES, "; ".join(v.message for v in violations))
+        messages = [*messages, {"role": "assistant", "content": raw}, {"role": "user", "content": guard.feedback(violations)}]
+
+    fixed = guard.autofix(answer, user_text)
+    if not fixed:
+        return None, None
+    remaining = guard.check(fixed, user_text, FACTS)
+    if any(v.hard for v in remaining):
+        log.warning("страж: нарушение факта не исправлено, отправляю безопасный ответ")
+        return guard.SAFE_TEXT, model
+    if remaining or fixed != answer:
+        log.warning("страж: ответ исправлен кодом")
+    return fixed, model
+
+
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     history: list[dict] = context.user_data.setdefault("history", [])
-    history.append({"role": "user", "content": update.message.text})
+    user_text = update.message.text
+    canned = guard.pregate(user_text)
+    if canned:  # вне темы или попытка взлома: модель не вызываем
+        log.info("страж: готовый отказ без модели")
+        history += [{"role": "user", "content": user_text}, {"role": "assistant", "content": canned}]
+        del history[:-HISTORY_LIMIT]
+        await update.message.reply_text(canned, reply_markup=MAIN_KB)
+        return
+    history.append({"role": "user", "content": user_text})
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history[-HISTORY_LIMIT:]]
-    answer, model = await ask_llm(context.application.bot_data["http"], messages)
+    answer, model = await generate_checked(context.application.bot_data["http"], history, user_text)
     if answer is None:
         history.pop()
         await update.message.reply_text(LLM_FAIL_TEXT, reply_markup=MAIN_KB)
